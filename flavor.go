@@ -161,6 +161,13 @@ func (f Flavor) NewCTEQueryBuilder() *CTEQueryBuilder {
 	return b
 }
 
+// NewRowNumberBuilder creates a new ROW_NUMBER builder with flavor.
+func (f Flavor) NewRowNumberBuilder() *RowNumberBuilder {
+	b := newRowNumberBuilder()
+	b.SetFlavor(f)
+	return b
+}
+
 // Quote adds quote for name to make sure the name can be used safely
 // as table name or field name.
 //

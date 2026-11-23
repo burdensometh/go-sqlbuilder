@@ -12,6 +12,7 @@
   - [Build `WHERE` clause](#build-where-clause)
   - [Share `WHERE` clause among builders](#share-where-clause-among-builders)
   - [Build `ORDER BY` clause](#build-order-by-clause)
+  - [Pick the first row in every group](#pick-the-first-row-in-every-group)
   - [Build SQL for different systems](#build-sql-for-different-systems)
   - [Using `Struct` as a light weight ORM](#using-struct-as-a-light-weight-orm)
   - [Nested SQL](#nested-sql)
@@ -85,6 +86,7 @@ This package includes the following pre-defined builders. API documentation and 
 - [DeleteBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#DeleteBuilder): Builder for `DELETE`.
 - [UnionBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#UnionBuilder): Builder for `UNION` and `UNION ALL`.
 - [CTEBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#CTEBuilder): Builder for Common Table Expression (CTE), e.g. `WITH name (col1, col2) AS (SELECT ...)`.
+- [RowNumberBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#RowNumberBuilder): Builder that keeps the first row in every composite-key group using `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`.
 - [Buildf](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#Buildf): Freestyle builder employing `fmt.Sprintf`-like syntax.
 - [Build](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#Build): Advanced freestyle builder utilizing special syntax as defined in [Args#Compile](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#Args.Compile).
 - [BuildNamed](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#BuildNamed): Advanced freestyle builder that uses `${key}` to reference values by key in a map.
@@ -244,6 +246,63 @@ fmt.Println(sql)
 ```
 
 The older `OrderBy` method combined with `Asc`/`Desc` is still available but deprecated, as it only supports a single ordering direction for all columns. The new `OrderByAsc` and `OrderByDesc` methods provide more flexibility and clarity when working with multiple columns.
+
+### Pick the first row in every group
+
+When several sources land duplicate rows for the same business key, a common governance rule is to keep only one row per key — for example, the row with the highest update time, breaking ties by source priority, and then load the survivors with `INSERT INTO ... SELECT ...`.
+
+`RowNumberBuilder` wraps any `SELECT` builder with a `ROW_NUMBER()` window function. `PartitionBy` defines the composite business key, `OrderBy`/`OrderByDesc` define the ranking order, and only rows ranked 1 are kept. The source builder is embedded as a subquery and is never modified, so it can be reused elsewhere.
+
+```go
+source := sqlbuilder.NewSelectBuilder()
+source.Select("id", "invoice_no", "source_code", "updated_at", "amount", "payload")
+source.From("stg_invoice")
+source.Where(source.Equal("load_date", "2026-11-23"))
+
+rnb := sqlbuilder.NewRowNumberBuilder()
+rnb.From(source)
+
+// One partition per invoice number. NullIfEmpty treats NULL and "" as one empty key.
+rnb.PartitionBy(sqlbuilder.NullIfEmpty("invoice_no"))
+
+// Latest update wins, then the higher-priority source.
+rnb.OrderByDesc("updated_at").OrderByDesc("source_priority")
+
+// A unique final sort key makes the result stable even when every value ties.
+rnb.TieBreaker("id")
+
+sql, args := rnb.Build()
+fmt.Println(sql)
+fmt.Println(args)
+
+// Output:
+// SELECT * FROM (SELECT ROW_NUMBER() OVER (PARTITION BY NULLIF(invoice_no, '') ORDER BY updated_at DESC, source_priority DESC, id ASC) AS rn, * FROM (SELECT id, invoice_no, source_code, updated_at, amount, payload FROM stg_invoice WHERE load_date = ?) AS t) AS t WHERE rn = 1
+// [2026-11-23]
+```
+
+Use `Select` to project exactly the columns a target table expects, in its order, then nest the builder into an `INSERT ... SELECT`:
+
+```go
+rnb.Select("invoice_no", "source_code", "updated_at", "amount", "payload")
+
+ib := sqlbuilder.PostgreSQL.NewInsertBuilder()
+ib.InsertInto("dwd_invoice")
+ib.Cols("invoice_no", "source_code", "updated_at", "amount", "payload")
+insertSelect := ib.Select("*")
+insertSelect.From(insertSelect.BuilderAs(rnb, "dedup"))
+
+sql, _ := ib.Build()
+fmt.Println(sql)
+
+// Output:
+// INSERT INTO dwd_invoice (invoice_no, source_code, updated_at, amount, payload) SELECT * FROM (SELECT invoice_no, source_code, updated_at, amount, payload FROM (SELECT ROW_NUMBER() OVER (PARTITION BY NULLIF(invoice_no, '') ORDER BY updated_at DESC, source_priority DESC, id ASC) AS rn, * FROM (SELECT id, invoice_no, source_code, updated_at, amount, payload FROM stg_invoice WHERE load_date = $1) AS t) AS t WHERE rn = 1) AS dedup
+```
+
+Notes on deterministic ranking and empty keys:
+
+- `TieBreaker` appends a unique column (typically the primary key) as the last `ORDER BY` term. Without it, `ROW_NUMBER` still assigns distinct ranks when business columns tie, but the database is free to pick any of the tied rows, so repeated runs may return different winners.
+- `NullIfEmpty(col)` emits `NULLIF(col, '')`, normalizing an empty string to `NULL`; `CoalesceEmpty(col)` emits `COALESCE(col, '')`, normalizing `NULL` to an empty string. Pick one so that a missing key stored as `NULL` or `""` belongs to the same partition. `CoalesceEmpty` additionally gives the empty key a fixed sort position instead of relying on the database's `NULL` ordering.
+- Without `PartitionBy`, all rows form one partition and only the globally first row is kept.
 
 ### Build SQL for different systems
 
@@ -539,6 +598,7 @@ Supported builders with `Clone`:
 - [CTEQueryBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#CTEQueryBuilder)
 - [DeleteBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#DeleteBuilder)
 - [InsertBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#InsertBuilder)
+- [RowNumberBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#RowNumberBuilder)
 - [SelectBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#SelectBuilder)
 - [UnionBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#UnionBuilder)
 - [UpdateBuilder](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#UpdateBuilder)
