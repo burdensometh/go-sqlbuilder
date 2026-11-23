@@ -12,6 +12,7 @@
   - [Build `WHERE` clause](#build-where-clause)
   - [Share `WHERE` clause among builders](#share-where-clause-among-builders)
   - [Build `ORDER BY` clause](#build-order-by-clause)
+  - [Keyset pagination](#keyset-pagination)
   - [Build SQL for different systems](#build-sql-for-different-systems)
   - [Using `Struct` as a light weight ORM](#using-struct-as-a-light-weight-orm)
   - [Nested SQL](#nested-sql)
@@ -244,6 +245,42 @@ fmt.Println(sql)
 ```
 
 The older `OrderBy` method combined with `Asc`/`Desc` is still available but deprecated, as it only supports a single ordering direction for all columns. The new `OrderByAsc` and `OrderByDesc` methods provide more flexibility and clarity when working with multiple columns.
+
+### Keyset pagination
+
+When paging through a large result set — e.g. exporting transactions ordered by update time — `OFFSET` is both slow and unreliable: rows written between two pages can be duplicated or skipped, and a sort key like `updated_at` is usually not unique (many transactions can share the same second). Keyset pagination (a.k.a. the seek method) solves this by continuing *strictly after the last row of the previous page* instead of skipping a number of rows.
+
+`SelectBuilder.SeekAfter` adds a continuation condition to `WHERE` that matches the actual `ORDER BY`: the sort column values of the last seen row identify the exact position to continue from. To make the position exact, the `ORDER BY` columns as a whole must be unique — sort by the non-unique column first and append a unique column (e.g. the primary key) as the tie breaker.
+
+```go
+base := sqlbuilder.NewSelectBuilder()
+base.Select("id", "updated_at", "amount").From("transactions")
+base.OrderByAsc("updated_at").OrderByAsc("id") // id breaks ties on updated_at.
+base.Limit(500)
+
+// Page 1: no continuation position yet.
+sql, args := base.Clone().Build()
+
+// Page 2 and later: continue strictly after the (updated_at, id) values of
+// the last row of the previous page. Repeat until a page returns fewer than
+// 500 rows to read to the end.
+page := base.Clone()
+page.SeekAfter(lastUpdatedAt, lastID)
+sql, args = page.Build()
+
+fmt.Println(sql)
+
+// Output:
+// SELECT id, updated_at, amount FROM transactions WHERE (updated_at, id) > (?, ?) ORDER BY updated_at ASC, id ASC LIMIT ?
+```
+
+The direction and tie-breaking strategy:
+
+- Every `ORDER BY` column keeps its own direction: rows after the position have greater values for `ASC` columns and smaller ones for `DESC` columns. `SeekBefore` mirrors this to read pages in reverse.
+- Ties are broken lexicographically: when leading columns compare equal, the following columns decide. The comparison is strict on the whole tuple, so with a unique `ORDER BY` tuple consecutive pages never overlap and never skip rows.
+- When all columns share the same direction and the flavor supports row value comparison, the condition is a row value comparison like `(updated_at, id) > (?, ?)`. Otherwise — for flavors without row value comparison (e.g. SQLServer, CQL, Informix, Doris) or for mixed sort directions — the same key range is selected by an equivalent expanded condition like `(updated_at > ?) OR (updated_at = ? AND id > ?)`.
+- The sort columns should be `NOT NULL`: `NULL` never satisfies the continuation comparison.
+
 
 ### Build SQL for different systems
 
