@@ -414,6 +414,26 @@ Here are important considerations regarding the field mapper:
 
 Refer to the [field mapper function sample](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#FieldMapperFunc) for an illustrative example.
 
+#### Inserting many records in batches
+
+`Struct#InsertInto` puts every record into a single statement. Many drivers cap the number of placeholders a prepared statement may have, so a large insert fails as a whole once that cap is exceeded. `Struct#InsertIntoBatches` (and its `InsertIgnoreIntoBatches` / `ReplaceIntoBatches` variants) instead returns several statements, each using no more placeholders than the limit supplied by the caller:
+
+```go
+batches, err := userStruct.InsertIntoBatches("user", 1000, users...)
+if err != nil {
+    // A single record needs more than 1000 placeholders; err is an
+    // *sqlbuilder.InsertRowExceedsPlaceholderLimitError naming its index.
+}
+
+for _, batch := range batches {
+    sql, args := batch.Build()
+    db.Exec(sql, args...)
+}
+```
+
+The column list of each batch is derived from the records it contains. A record whose optional (`fieldopt:"omitempty"`) fields are empty binds fewer values, and a column left empty by every record in a batch is dropped from that batch's statement, so batches are sized by the placeholders they actually bind. Records keep their original order, and `InsertBatch#Indices` records the position each row had in the input so results can be mapped back. An empty batch is never emitted, and items whose type does not match the `Struct` are ignored, just like `InsertInto`. Passing a non-positive limit disables batching and produces a single statement.
+
+
 ### Nested SQL
 
 Creating nested SQL is straightforward: simply use a builder as an argument for nesting.
