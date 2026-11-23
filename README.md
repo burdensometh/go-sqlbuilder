@@ -16,6 +16,7 @@
   - [Using `Struct` as a light weight ORM](#using-struct-as-a-light-weight-orm)
   - [Nested SQL](#nested-sql)
   - [Nested `JOIN`](#nested-join)
+  - [Point-in-time dimension `JOIN`](#point-in-time-dimension-join)
   - [Use `sql.Named` in a builder](#use-sqlnamed-in-a-builder)
   - [Argument modifiers](#argument-modifiers)
   - [Freestyle builder](#freestyle-builder)
@@ -471,6 +472,71 @@ fmt.Println(args)
 // Output:
 // SELECT a.id, a.user_id FROM users AS a JOIN (SELECT b.id, b.user_id FROM users2 AS b WHERE b.age > ?) AS b ON a.user_id = b.user_id
 // [20]
+```
+
+### Point-in-time dimension `JOIN`
+
+Facts often store only a dimension key, while the dimension table keeps one row per version over a time range. `JoinDimension` builds the join that looks the right version up by the fact's own timestamp. A version is valid over the left-closed, right-open interval `[start_time, end_time)`; a `NULL` end time means the version is still valid. The generated predicate is:
+
+```sql
+fact_time >= start_time AND (end_time IS NULL OR fact_time < end_time)
+```
+
+The join defaults to `LEFT JOIN`, so facts without any matching version are kept instead of being dropped.
+
+```go
+sb := sqlbuilder.NewSelectBuilder()
+sb.Select("f.id", "c.category_id")
+sb.From("txn f")
+sb.JoinDimension(&sqlbuilder.DimensionJoin{
+    Table:        "product_category c",
+    FactKey:      "f.product_id",
+    DimensionKey: "c.product_id",
+    FactTime:     "f.txn_time",
+    StartTime:    "c.start_time",
+    EndTime:      "c.end_time",
+})
+
+sql, args := sb.Build()
+fmt.Println(sql)
+fmt.Println(args)
+
+// Output:
+// SELECT f.id, c.category_id FROM txn f LEFT JOIN product_category c ON f.product_id = c.product_id AND f.txn_time >= c.start_time AND (c.end_time IS NULL OR f.txn_time < c.end_time)
+// []
+```
+
+`JoinPointInTime` is a shorthand for the common case above:
+
+```go
+sb.JoinPointInTime(
+    "product_category c",
+    "f.product_id", "c.product_id",
+    "f.txn_time",
+    "c.start_time", "c.end_time",
+)
+```
+
+Set `DimensionJoin.Option` to change the join type, leave `EndTime` empty for a dimension without an end column, and use `On` for composite keys or extra conditions.
+
+Overlapping versions are not collapsed. A fact matching more than one version produces one row per version, so grouping by the fact and keeping the duplicates lets a warehouse caller find the conflicting facts:
+
+```go
+sb := sqlbuilder.NewSelectBuilder()
+sb.Select("f.id", "COUNT(*) AS version_count")
+sb.From("txn f")
+sb.JoinDimension(&sqlbuilder.DimensionJoin{
+    Table:        "product_category c",
+    FactKey:      "f.product_id",
+    DimensionKey: "c.product_id",
+    FactTime:     "f.txn_time",
+    StartTime:    "c.start_time",
+    EndTime:      "c.end_time",
+})
+sb.GroupBy("f.id").Having("COUNT(*) > 1")
+
+// Output:
+// SELECT f.id, COUNT(*) AS version_count FROM txn f LEFT JOIN product_category c ON f.product_id = c.product_id AND f.txn_time >= c.start_time AND (c.end_time IS NULL OR f.txn_time < c.end_time) GROUP BY f.id HAVING COUNT(*) > 1
 ```
 
 ### Use `sql.Named` in a builder

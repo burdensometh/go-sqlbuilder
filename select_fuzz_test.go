@@ -350,6 +350,16 @@ func generateArgumentForType(argType reflect.Type, data []byte) reflect.Value {
 		if argType == reflect.TypeOf((*WhereClause)(nil)) {
 			return reflect.ValueOf(NewWhereClause())
 		}
+		if argType == reflect.TypeOf((*DimensionJoin)(nil)) {
+			return reflect.ValueOf(&DimensionJoin{
+				Table:        string(data),
+				FactKey:      string(data),
+				DimensionKey: string(data),
+				FactTime:     string(data),
+				StartTime:    string(data),
+				EndTime:      string(data),
+			})
+		}
 		if argType == reflect.TypeOf((*SelectBuilder)(nil)) {
 			return reflect.ValueOf(NewSelectBuilder())
 		}
