@@ -208,4 +208,5 @@ func (f Flavor) PrepareInsertIgnore(table string, ib *InsertBuilder) {
 	// Set the table and reset the marker right after insert into
 	ib.table = Escape(table)
 	ib.marker = insertMarkerAfterInsertInto
+	ib.insertIgnore = true
 }

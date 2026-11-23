@@ -659,6 +659,62 @@ fmt.Println(err)
 // <nil>
 ```
 
+### Versioned upsert with a composite conflict key
+
+When an incremental feed can be redelivered and a historical batch may land after a newer batch, an append-only upsert must overwrite business columns only when the incoming row carries a strictly newer version. `InsertBuilder` supports this with two chained methods:
+
+- `OnConflict(col ...string)` declares the composite conflict (business) key columns. The table must have a unique constraint or unique index covering all of them.
+- `VersionCol(col string)` declares the version column used for the comparison.
+
+The generated statement guarantees that:
+
+- a row with a new conflict key is inserted normally;
+- re-running the same statement with the same version neither inserts a duplicate row nor changes existing data;
+- on a conflicting key, business columns (everything except the conflict key, including the version column) are overwritten only when the incoming version is strictly greater than the stored one;
+- conflict key columns are never part of the update assignment, so an existing business key is never modified.
+
+This feature is only supported on **MySQL**, **PostgreSQL** and **SQLite**. Calling `Build` on any other flavor panics with `ErrInsertUpsertNotImplemented`. It cannot be combined with `InsertIgnoreInto`, `ReplaceInto` or a `SELECT`-based insert.
+
+On PostgreSQL and SQLite the dialect-native `ON CONFLICT ... DO UPDATE ... WHERE` clause is used, so the whole row update is skipped when the version is stale or equal:
+
+```go
+ib := PostgreSQL.NewInsertBuilder()
+ib.InsertInto("demo.user")
+ib.Cols("id", "shard", "name", "status", "version")
+ib.Values(1, 7, "Huan Du", 1, 100)
+ib.OnConflict("id", "shard")
+ib.VersionCol("version")
+
+sql, args := ib.Build()
+fmt.Println(sql)
+fmt.Println(args)
+
+// Output:
+// INSERT INTO demo.user (id, shard, name, status, version) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id, shard) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, version = EXCLUDED.version WHERE EXCLUDED.version > demo.user.version
+// [1 7 Huan Du 1 100]
+```
+
+On MySQL there is no `WHERE` clause in `ON DUPLICATE KEY UPDATE`, and the conflict target is taken from the table's unique index rather than listed in the statement. Each assignment is therefore guarded by an `IF(...)` that keeps the existing value when the incoming version is not greater:
+
+```go
+ib := MySQL.NewInsertBuilder()
+ib.InsertInto("demo.user")
+ib.Cols("id", "shard", "name", "status", "version")
+ib.Values(1, 7, "Huan Du", 1, 100)
+ib.OnConflict("id", "shard")
+ib.VersionCol("version")
+
+sql, args := ib.Build()
+fmt.Println(sql)
+fmt.Println(args)
+
+// Output:
+// INSERT INTO demo.user (id, shard, name, status, version) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = IF(VALUES(version) > demo.user.version, VALUES(name), demo.user.name), status = IF(VALUES(version) > demo.user.version, VALUES(status), demo.user.status), version = IF(VALUES(version) > demo.user.version, VALUES(version), demo.user.version)
+// [1 7 Huan Du 1 100]
+```
+
+Note that the version column must also appear in `Cols`, and all conflict and version columns must be listed there too.
+
 ## License
 
 This package is licensed under the MIT license. For more information, refer to the LICENSE file.
