@@ -5,6 +5,8 @@ package sqlbuilder
 
 import (
 	"fmt"
+
+	"github.com/huandu/go-clone"
 )
 
 // Builder is a general SQL builder.
@@ -61,6 +63,40 @@ func WithFlavor(builder Builder, flavor Flavor) Builder {
 		builder: builder,
 		flavor:  flavor,
 	}
+}
+
+// Fork creates n independent deep copies of builder. All CTEs, WHERE clauses
+// and the args scope are cloned together with builder, so that every copy can
+// be customized independently, e.g. adding partition-specific filters, without
+// affecting the original builder or any other copy.
+//
+// Fork is the entry point to generate a set of partition queries from the
+// same assembled base query:
+//
+//	base := sqlbuilder.Select("id", "status").From("orders").Where(...)
+//	queries := sqlbuilder.Fork(base, len(reports))
+//
+//	for i, report := range reports {
+//		q := queries[i]
+//		q.Where(q.Equal("status", report.Status)) // report-specific filters
+//	}
+//
+// Each forked query is a Builder and can be consumed individually, e.g. by
+// an outer INSERT ... SELECT built with InsertBuilder.SelectBuilder.
+//
+// If n is less than or equal to 0, Fork returns nil.
+func Fork[B Builder](builder B, n int) []B {
+	if n <= 0 {
+		return nil
+	}
+
+	builders := make([]B, n)
+
+	for i := range builders {
+		builders[i] = clone.Clone(builder).(B)
+	}
+
+	return builders
 }
 
 // Buildf creates a Builder from a format string using `fmt.Sprintf`-like syntax.

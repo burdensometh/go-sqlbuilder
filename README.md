@@ -20,6 +20,7 @@
   - [Argument modifiers](#argument-modifiers)
   - [Freestyle builder](#freestyle-builder)
   - [Clone builders](#clone-builders)
+  - [Fork builders](#fork-builders)
   - [Using special syntax to build SQL](#using-special-syntax-to-build-sql)
   - [Interpolate `args` in the `sql`](#interpolate-args-in-the-sql)
 - [License](#license)
@@ -572,6 +573,45 @@ func GetActiveUserByID(id int64) (string, []interface{}) {
 ```
 
 The same template pattern applies to other builders. For example, keep a base `UpdateBuilder` with the table and common `SET` clauses, or a base `CTEBuilder` defining reusable CTEs, then `Clone()` and add query-specific `WHERE`/`ORDER BY`/`LIMIT`/`RETURNING` as needed.
+
+### Fork builders
+
+`Fork` is the entry point to generate a set of independent partition queries from the same assembled base query. It deep-clones the builder `n` times in one call — CTEs, `WHERE` clauses and the args scope are cloned together with the builder, so every forked query can be customized in parallel (e.g. appending different date and status conditions per report) without affecting the base query or each other, and without ever sharing parameter positions.
+
+```go
+// Assemble the base order query once, with a CTE and shared filters.
+cte := sqlbuilder.With(
+    sqlbuilder.CTEQuery("recent_orders").As(
+        sqlbuilder.Select("id", "user_id", "status", "amount", "created_at").
+            From("orders").
+            Where("created_at >= '2026-01-01'"),
+    ),
+)
+base := sqlbuilder.NewSelectBuilder().With(cte).
+    Select("id", "user_id", "status", "amount").
+    From("recent_orders")
+base.Where(base.In("status", "paid", "shipped"))
+
+// Fork the base query into independent partition queries, one per report.
+partitions := sqlbuilder.Fork(base, len(reports))
+
+for i, report := range reports {
+    q := partitions[i]
+    q.Where(q.Equal("status", report.Status))
+    q.Where(q.Between("created_at", report.From, report.To))
+}
+```
+
+Each forked query is a `Builder` and can be consumed individually by an outer `INSERT ... SELECT` via `InsertBuilder.SelectBuilder`. The query is compiled within the args scope of the `InsertBuilder`, so its args are merged and placeholders renumbered properly.
+
+```go
+ib := sqlbuilder.NewInsertBuilder()
+ib.InsertInto("report_orders").Cols("id", "user_id", "status", "amount")
+ib.SelectBuilder(partitions[0])
+
+sql, args := ib.Build()
+// INSERT INTO report_orders (id, user_id, status, amount) WITH recent_orders AS (...) SELECT ... WHERE status IN (?, ?) AND status = ? AND created_at BETWEEN ? AND ?
+```
 
 ### Using special syntax to build SQL
 

@@ -231,6 +231,99 @@ func ExampleInsertBuilder_subSelect_informix() {
 	// [1]
 }
 
+func ExampleInsertBuilder_SelectBuilder() {
+	// A query built elsewhere, e.g. a partition query forked from a base query.
+	sb := NewSelectBuilder()
+	sb.Select("id", "name").From("demo.test")
+	sb.Where(sb.Equal("id", 1))
+
+	// Consume the query in an outer INSERT ... SELECT.
+	ib := NewInsertBuilder()
+	ib.InsertInto("demo.user")
+	ib.Cols("id", "name")
+	ib.SelectBuilder(sb)
+
+	sql, args := ib.Build()
+	fmt.Println(sql)
+	fmt.Println(args)
+
+	// Output:
+	// INSERT INTO demo.user (id, name) SELECT id, name FROM demo.test WHERE id = ?
+	// [1]
+}
+
+func TestInsertBuilderSelectBuilder(t *testing.T) {
+	a := assert.New(t)
+
+	// A partition query with a CTE, filters and args of its own.
+	cte := With(
+		CTEQuery("recent_orders").As(
+			Select("id", "user_id", "status", "amount", "created_at").
+				From("orders").
+				Where("created_at >= '2026-01-01'"),
+		),
+	)
+	sb := PostgreSQL.NewSelectBuilder().With(cte).
+		Select("id", "user_id", "status", "amount").
+		From("recent_orders")
+	sb.Where(sb.Equal("status", "paid"))
+	sb.Where(sb.Between("created_at", "2026-11-01", "2026-11-02"))
+
+	ib := PostgreSQL.NewInsertBuilder()
+	ib.InsertInto("report_orders").Cols("id", "user_id", "status", "amount")
+	ib.SelectBuilder(sb)
+
+	sql, args := ib.Build()
+	a.Equal(sql, "INSERT INTO report_orders (id, user_id, status, amount) "+
+		"WITH recent_orders AS (SELECT id, user_id, status, amount, created_at FROM orders WHERE created_at >= '2026-01-01') "+
+		"SELECT id, user_id, status, amount FROM recent_orders WHERE status = $1 AND created_at BETWEEN $2 AND $3")
+	a.Equal(args, []interface{}{"paid", "2026-11-01", "2026-11-02"})
+
+	// The consumed query is compiled within the args scope of ib:
+	// its placeholders are renumbered after ib's own args.
+	ib2 := PostgreSQL.NewInsertBuilder()
+	ib2.InsertInto("report_orders").Cols("id", "user_id", "status", "amount")
+	ib2.SQL("/* " + ib2.Var("etl") + " */")
+	ib2.SelectBuilder(sb)
+
+	sql, args = ib2.Build()
+	a.Equal(sql, "INSERT INTO report_orders (id, user_id, status, amount) /* $1 */ "+
+		"WITH recent_orders AS (SELECT id, user_id, status, amount, created_at FROM orders WHERE created_at >= '2026-01-01') "+
+		"SELECT id, user_id, status, amount FROM recent_orders WHERE status = $2 AND created_at BETWEEN $3 AND $4")
+	a.Equal(args, []interface{}{"etl", "paid", "2026-11-01", "2026-11-02"})
+
+	// The same query can be consumed by both inserts independently.
+	a.Equal(sb.String(), "WITH recent_orders AS (SELECT id, user_id, status, amount, created_at FROM orders WHERE created_at >= '2026-01-01') "+
+		"SELECT id, user_id, status, amount FROM recent_orders WHERE status = $1 AND created_at BETWEEN $2 AND $3")
+}
+
+func TestInsertBuilderSelectBuilderReplace(t *testing.T) {
+	a := assert.New(t)
+
+	sb1 := Select("id").From("t1")
+	sb2 := Select("id").From("t2")
+
+	// Only the builder set last is used.
+	ib := NewInsertBuilder()
+	ib.InsertInto("t").Cols("id")
+	ib.SelectBuilder(sb1).SelectBuilder(sb2)
+	a.Equal(ib.String(), "INSERT INTO t (id) SELECT id FROM t2")
+
+	// SelectBuilder overrides Values, like Select does.
+	ib = NewInsertBuilder()
+	ib.InsertInto("t").Cols("id")
+	ib.Values(1)
+	ib.SelectBuilder(sb1)
+	a.Equal(ib.String(), "INSERT INTO t (id) SELECT id FROM t1")
+
+	// A nil builder removes the SELECT statement.
+	ib = NewInsertBuilder()
+	ib.InsertInto("t").Cols("id")
+	ib.SelectBuilder(sb1)
+	ib.SelectBuilder(nil)
+	a.Equal(ib.String(), "INSERT INTO t (id)")
+}
+
 func ExampleInsertBuilder_NumValue() {
 	ib := NewInsertBuilder()
 	ib.InsertInto("demo.user")

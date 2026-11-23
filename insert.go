@@ -109,6 +109,29 @@ func (isb *InsertBuilder) Select(col ...string) *SelectBuilder {
 	return sb
 }
 
+// SelectBuilder sets an existing builder, e.g. a SelectBuilder, as the SELECT
+// statement in INSERT INTO ... SELECT .... It's useful to consume a query
+// built elsewhere, e.g. a partition query forked from a base query by Fork,
+// in an outer INSERT ... SELECT.
+//
+// The builder is compiled within the args scope of ib: all its args are merged
+// into ib's args and placeholders are renumbered properly, so the query can be
+// consumed by ib independently of any other query.
+//
+// If SelectBuilder is called multiple times, or Select was called before,
+// only the builder set last is used. If builder is nil, the SELECT statement
+// is removed from ib.
+func (ib *InsertBuilder) SelectBuilder(builder Builder) *InsertBuilder {
+	if builder == nil {
+		ib.sbHolder = ""
+		return ib
+	}
+
+	ib.sbHolder = ib.args.Add(builder)
+	ib.marker = insertMarkerAfterSelect
+	return ib
+}
+
 // Values adds a list of values for a row in INSERT.
 func (ib *InsertBuilder) Values(value ...interface{}) *InsertBuilder {
 	placeholders := make([]string, 0, len(value))
