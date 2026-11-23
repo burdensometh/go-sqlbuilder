@@ -12,6 +12,7 @@
   - [Build `WHERE` clause](#build-where-clause)
   - [Share `WHERE` clause among builders](#share-where-clause-among-builders)
   - [Build `ORDER BY` clause](#build-order-by-clause)
+  - [Align `UNION ALL` sources to a target schema](#align-union-all-sources-to-a-target-schema)
   - [Build SQL for different systems](#build-sql-for-different-systems)
   - [Using `Struct` as a light weight ORM](#using-struct-as-a-light-weight-orm)
   - [Nested SQL](#nested-sql)
@@ -244,6 +245,43 @@ fmt.Println(sql)
 ```
 
 The older `OrderBy` method combined with `Asc`/`Desc` is still available but deprecated, as it only supports a single ordering direction for all columns. The new `OrderByAsc` and `OrderByDesc` methods provide more flexibility and clarity when working with multiple columns.
+
+### Align `UNION ALL` sources to a target schema
+
+Sources merged with `UNION ALL` sometimes expose columns in different orders, and newer sources may add nullable columns. `UnionAllWithSchema` takes a target column definition and aligns every source projection to it: source columns are reordered by name, and an optional column a source does not provide is filled with an explicitly typed `CAST(NULL AS <type>) AS <column>`. A missing required column returns an error naming both the source and the column.
+
+```go
+cols := []sqlbuilder.UnionColumn{
+    {Name: "id"},
+    {Name: "amount"},
+    {Name: "region", Type: "VARCHAR(32)", Optional: true},
+}
+
+legacy := sqlbuilder.Select("order_id", "amount_cent").From("legacy_orders")
+modern := sqlbuilder.Select("region", "amount_yuan", "id").From("modern_orders")
+
+ub, err := sqlbuilder.UnionAllWithSchema(cols, []sqlbuilder.UnionSource{
+    {
+        Name:    "legacy_orders",
+        Builder: legacy,
+        Columns: map[string]string{
+            "id":     "src.order_id",
+            "amount": "src.amount_cent / 100",
+        },
+    },
+    {
+        Name:    "modern_orders",
+        Builder: modern,
+        Columns: map[string]string{
+            "id":     "src.id",
+            "amount": "src.amount_yuan",
+            "region": "src.region",
+        },
+    },
+})
+```
+
+Each source is wrapped in a derived table aliased as `src`, so column expressions reference `src.<expression>`. The resulting `UnionBuilder` is itself a `Builder` and can be embedded into another query, for instance as a derived table of a `SELECT` that keeps aggregating by business region.
 
 ### Build SQL for different systems
 
