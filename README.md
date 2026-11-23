@@ -414,6 +414,51 @@ Here are important considerations regarding the field mapper:
 
 Refer to the [field mapper function sample](https://pkg.go.dev/github.com/huandu/go-sqlbuilder#FieldMapperFunc) for an illustrative example.
 
+#### Partial updates
+
+When an upstream source sends only part of a record, `Struct#Update` isn't a good fit: it writes every field, so a field the source never collected would be overwritten with a zero value or `NULL`. Use `Struct#UpdatePartial` instead. It writes only the fields the value actually carries and always scopes the statement to a business key.
+
+Use pointers to say which fields arrived:
+
+- `*T` is `nil`: the source didn't collect the field; it is **not written** at all.
+- `*T` is non-nil: the field **is written**, even when it points to a zero value such as `0` or `""`.
+- `**T` with a non-nil outer pointer and a nil inner pointer: the source **explicitly cleared** the field; it is written as `NULL`.
+
+The key columns are never assigned in `SET`, and every key must resolve to a field with a usable value. If the value carries no writable field, `UpdatePartial` returns `ErrUpdatePartialNoChanges` instead of a builder, so the caller can skip the statement and avoid touching any other row.
+
+```go
+type Stock struct {
+    SKU      int64    `db:"sku_id"`
+    Quantity *int64   `db:"quantity"`
+    Reason   **string `db:"reason"`
+}
+
+var stockStruct = sqlbuilder.NewStruct(new(Stock))
+
+// The source cleared reason, set quantity to 0, and never collected other fields.
+zero := int64(0)
+cleared := (*string)(nil)
+patch := &Stock{
+    SKU:      42,
+    Quantity: &zero,    // written as 0
+    Reason:   &cleared, // written as NULL
+}
+
+ub, err := stockStruct.UpdatePartial("inventory", patch, "sku_id")
+switch {
+case errors.Is(err, sqlbuilder.ErrUpdatePartialNoChanges):
+    return nil // nothing arrived; don't touch any product
+case err != nil:
+    return err
+}
+
+sql, args := ub.Build()
+// UPDATE inventory SET quantity = ?, reason = ? WHERE sku_id = ?
+// [0 <nil> 42]
+```
+
+`UpdatePartial` honors the same `WithTag`/`WithoutTag`/`omitempty` options as the other `Struct` methods, so a partial-update type can be kept separate from the full record type used for INSERT.
+
 ### Nested SQL
 
 Creating nested SQL is straightforward: simply use a builder as an argument for nesting.

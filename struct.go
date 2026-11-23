@@ -5,11 +5,30 @@ package sqlbuilder
 
 import (
 	"database/sql/driver"
+	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
+)
+
+var (
+	// ErrUpdatePartialNoChanges is returned by Struct.UpdatePartial when value
+	// doesn't carry any field that should be written. In this case no SQL is
+	// generated, so the caller can safely treat it as a no-op and skip the
+	// statement instead of running an UPDATE without assignments.
+	ErrUpdatePartialNoChanges = errors.New("sqlbuilder: partial update has no fields to change")
+
+	// ErrUpdatePartialMissingKey is returned by Struct.UpdatePartial when the
+	// business key used to locate the record is missing or unusable. A partial
+	// update never runs without a key, so it can't accidentally affect other rows.
+	ErrUpdatePartialMissingKey = errors.New("sqlbuilder: partial update requires a business key")
+
+	// ErrUpdatePartialTypeMismatch is returned by Struct.UpdatePartial when
+	// value's type is not the struct type of Struct.
+	ErrUpdatePartialTypeMismatch = errors.New("sqlbuilder: partial update value type mismatch")
 )
 
 var (
@@ -412,6 +431,231 @@ func (s *Struct) updateWithTags(table string, with, without []string, value inte
 
 	ub.Set(assignments...)
 	return ub
+}
+
+// UpdatePartial creates a new `UpdateBuilder` that only writes fields which value
+// actually carries, and restricts the statement to records matching keyColumns.
+//
+// It is designed for partial updates where the source may not collect every field.
+// Unlike Update, a nil pointer field means "the field is not reached" and is left
+// untouched instead of being written as NULL. A non-nil pointer is always written,
+// even if it points to the zero value. To write an explicit NULL, use a pointer to
+// pointer: a non-nil outer pointer whose inner pointer is nil produces "field = NULL".
+//
+//	ub, err := st.UpdatePartial("inventory", patch, "sku_id")
+//	if errors.Is(err, sqlbuilder.ErrUpdatePartialNoChanges) {
+//		return nil // nothing to write; don't touch other products
+//	}
+//	if err != nil {
+//		return err
+//	}
+//
+// Field options such as `omitempty` are still honored for fields which can't express
+// absence (non-pointer fields); use pointers for values that may be omitted.
+//
+// keyColumns may be a column alias (the `db` tag), a field name, or the key returned
+// by fieldas. Every key must resolve to a field of s and carry a non-empty value;
+// otherwise UpdatePartial returns ErrUpdatePartialMissingKey and no builder. Key
+// columns are never assigned in SET.
+//
+// If no field is written, UpdatePartial returns a nil builder and
+// ErrUpdatePartialNoChanges, so a caller can skip the statement entirely.
+// If value's type is not the struct type of s, it returns
+// ErrUpdatePartialTypeMismatch.
+func (s *Struct) UpdatePartial(table string, value interface{}, keyColumns ...string) (*UpdateBuilder, error) {
+	sfs := s.structFieldsParser()
+	tagged := sfs.FilterTags(s.withTags, s.withoutTags)
+
+	ub := s.Flavor.NewUpdateBuilder()
+	ub.Update(table)
+
+	if tagged == nil {
+		return nil, ErrUpdatePartialNoChanges
+	}
+
+	v := reflect.ValueOf(value)
+
+	if !v.IsValid() {
+		return nil, ErrUpdatePartialTypeMismatch
+	}
+
+	// A typed nil pointer of the expected struct type carries nothing to write.
+	// Treat it as an empty patch rather than a type error, so callers don't need
+	// to special-case a nil payload before checking for a no-op.
+	if v.Kind() == reflect.Ptr && v.IsNil() {
+		if v.Type().Elem() == s.structType {
+			return nil, ErrUpdatePartialNoChanges
+		}
+
+		return nil, ErrUpdatePartialTypeMismatch
+	}
+
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return nil, ErrUpdatePartialTypeMismatch
+		}
+
+		v = v.Elem()
+	}
+
+	if v.Type() != s.structType {
+		return nil, ErrUpdatePartialTypeMismatch
+	}
+
+	if len(keyColumns) == 0 {
+		return nil, fmt.Errorf("%w: no key column is provided", ErrUpdatePartialMissingKey)
+	}
+
+	// Keys are resolved against all writable fields, so a business key can still be
+	// used when tags restrict the fields that may be assigned.
+	keyFields, keySet, err := resolvePartialUpdateKeys(sfs.noTag.ForWrite, keyColumns)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve key values and build the WHERE clause in the order of keyColumns,
+	// so the generated SQL is deterministic.
+	for _, kf := range keyFields {
+		keyValue, ok := partialUpdateKeyValue(v, kf)
+
+		if !ok {
+			return nil, fmt.Errorf("%w: %q has no usable value", ErrUpdatePartialMissingKey, kf.Alias)
+		}
+
+		ub.Where(ub.Equal(Escape(kf.Quote(s.Flavor)), keyValue))
+	}
+
+	capacity := len(tagged.ForWrite) - len(keyFields)
+
+	if capacity < 0 {
+		capacity = 0
+	}
+
+	assignments := make([]string, 0, capacity)
+
+	for _, sf := range tagged.ForWrite {
+		if keySet[sf] {
+			continue
+		}
+
+		data, reached := partialUpdateFieldValue(v, sf, s.withTags)
+
+		if !reached {
+			continue
+		}
+
+		assignments = append(assignments, ub.Assign(sf.Quote(s.Flavor), data))
+	}
+
+	if len(assignments) == 0 {
+		return nil, ErrUpdatePartialNoChanges
+	}
+
+	ub.Set(assignments...)
+	return ub, nil
+}
+
+// resolvePartialUpdateKeys maps names in keyColumns to writable struct fields.
+// The returned slice follows the order of keyColumns and the set is used to
+// exclude key columns from SET.
+func resolvePartialUpdateKeys(fields []*structField, keyColumns []string) (ordered []*structField, set map[*structField]bool, err error) {
+	ordered = make([]*structField, 0, len(keyColumns))
+	set = make(map[*structField]bool, len(keyColumns))
+
+	for _, name := range keyColumns {
+		var matched *structField
+
+		for _, sf := range fields {
+			if sf.Alias == name || sf.Name == name || sf.Key() == name {
+				matched = sf
+				break
+			}
+		}
+
+		if matched == nil {
+			return nil, nil, fmt.Errorf("%w: %q is not a writable field", ErrUpdatePartialMissingKey, name)
+		}
+
+		if set[matched] {
+			continue
+		}
+
+		set[matched] = true
+		ordered = append(ordered, matched)
+	}
+
+	return ordered, set, nil
+}
+
+// partialUpdateKeyValue returns the value of a key field.
+// Keys must be present and non-empty; otherwise the record can't be located safely.
+func partialUpdateKeyValue(v reflect.Value, sf *structField) (interface{}, bool) {
+	val, ok := fieldByIndex(v, sf.Index, false)
+
+	if !ok || !val.IsValid() {
+		return nil, false
+	}
+
+	for val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			return nil, false
+		}
+
+		if val.Type().Implements(typeOfSQLDriverValuer) {
+			break
+		}
+
+		val = val.Elem()
+	}
+
+	if !val.IsValid() || isEmptyValue(val) {
+		return nil, false
+	}
+
+	return val.Interface(), true
+}
+
+// partialUpdateFieldValue reports whether a field is reached by value and which
+// value should be assigned.
+//
+// A nil pointer or nil interface means the field was not provided by the source and
+// must not be written. A non-nil pointer is always written; if its inner value is
+// absent (e.g. **T with nil inner pointer), the field is assigned NULL.
+func partialUpdateFieldValue(v reflect.Value, sf *structField, limitTags []string) (data interface{}, reached bool) {
+	val, ok := fieldByIndex(v, sf.Index, false)
+
+	if !ok || !val.IsValid() {
+		return nil, false
+	}
+
+	kind := val.Kind()
+
+	if kind == reflect.Ptr || kind == reflect.Interface {
+		if val.IsNil() {
+			return nil, false
+		}
+
+		val = dereferencedFieldValue(val)
+
+		if !val.IsValid() {
+			return nil, true
+		}
+
+		return val.Interface(), true
+	}
+
+	if isEmptyValue(val) && sf.ShouldOmitEmpty(limitTags...) {
+		return nil, false
+	}
+
+	val = dereferencedFieldValue(val)
+
+	if !val.IsValid() {
+		return nil, true
+	}
+
+	return val.Interface(), true
 }
 
 // InsertInto creates a new `InsertBuilder` with table name using verb INSERT INTO.
