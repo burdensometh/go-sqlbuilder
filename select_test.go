@@ -6,6 +6,7 @@ package sqlbuilder
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/huandu/go-assert"
@@ -141,6 +142,53 @@ func ExampleSelectBuilder_nestedJoin() {
 	// Output:
 	// SELECT a.id, a.user_id FROM users AS a JOIN (SELECT b.id, b.user_id FROM users2 AS b WHERE b.age > ?) AS b ON a.user_id = b.user_id
 	// [20]
+}
+
+func ExampleSelectBuilder_incrementalReconciliation() {
+	// Nullable columns of the supplier table to reconcile. Every column is
+	// compared in a NULL-safe way so that a change from unknown (NULL) to a
+	// concrete value, or the other way around, is not missed.
+	columns := []string{"contact_name", "phone", "email"}
+
+	sb := NewSelectBuilder()
+
+	// Build a reusable NULL-safe "column changed" condition per column.
+	// The same conditions are used both to filter rows with changes and
+	// to list the changed fields of every row.
+	diff := make([]string, 0, len(columns)+2)
+	diff = append(diff,
+		sb.IsNull("o.supplier_code"), // Matched by no new row: deleted.
+		sb.IsNull("n.supplier_code"), // Matched by no old row: added.
+	)
+	changedFields := make([]string, 0, len(columns))
+
+	for _, col := range columns {
+		cond := sb.IsDistinctFromField("n."+col, "o."+col)
+		diff = append(diff, cond)
+		changedFields = append(changedFields, "CASE WHEN "+cond+" THEN "+sb.Var(col)+" END")
+	}
+
+	sb.Select(
+		// The business key is present on either side of the FULL OUTER JOIN.
+		"COALESCE(n.supplier_code, o.supplier_code) AS supplier_code",
+		// Distinguish added, deleted and same-key changed rows for downstream.
+		`CASE WHEN o.supplier_code IS NULL THEN 'added' WHEN n.supplier_code IS NULL THEN 'deleted' ELSE 'changed' END AS change_type`,
+		// List the fields whose values differ between the two snapshots.
+		"CONCAT_WS(',', "+strings.Join(changedFields, ", ")+") AS changed_fields",
+	)
+	sb.From("suppliers_new n")
+	sb.JoinWithOption(FullOuterJoin, "suppliers_old o",
+		"o.supplier_code = n.supplier_code",
+	)
+	sb.Where(sb.Or(diff...))
+
+	sql, args := sb.BuildWithFlavor(PostgreSQL)
+	fmt.Println(sql)
+	fmt.Println(args)
+
+	// Output:
+	// SELECT COALESCE(n.supplier_code, o.supplier_code) AS supplier_code, CASE WHEN o.supplier_code IS NULL THEN 'added' WHEN n.supplier_code IS NULL THEN 'deleted' ELSE 'changed' END AS change_type, CONCAT_WS(',', CASE WHEN n.contact_name IS DISTINCT FROM o.contact_name THEN $1 END, CASE WHEN n.phone IS DISTINCT FROM o.phone THEN $2 END, CASE WHEN n.email IS DISTINCT FROM o.email THEN $3 END) AS changed_fields FROM suppliers_new n FULL OUTER JOIN suppliers_old o ON o.supplier_code = n.supplier_code WHERE (o.supplier_code IS NULL OR n.supplier_code IS NULL OR n.contact_name IS DISTINCT FROM o.contact_name OR n.phone IS DISTINCT FROM o.phone OR n.email IS DISTINCT FROM o.email)
+	// [contact_name phone email]
 }
 
 func ExampleSelectBuilder_limit_offset() {

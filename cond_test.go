@@ -69,6 +69,8 @@ func TestCond(t *testing.T) {
 		newTestPair("0 = 1", func(c *Cond) string { return c.Some("$a", ">") }),
 		newTestPair("$a IS DISTINCT FROM $1", func(c *Cond) string { return c.IsDistinctFrom("$a", 1) }),
 		newTestPair("$a IS NOT DISTINCT FROM $1", func(c *Cond) string { return c.IsNotDistinctFrom("$a", 1) }),
+		newTestPair("$a IS DISTINCT FROM $b", func(c *Cond) string { return c.IsDistinctFromField("$a", "$b") }),
+		newTestPair("$a IS NOT DISTINCT FROM $b", func(c *Cond) string { return c.IsNotDistinctFromField("$a", "$b") }),
 		newTestPair("$1", func(c *Cond) string { return c.Var(123) }),
 	}
 
@@ -160,6 +162,10 @@ func TestEmptyCond(t *testing.T) {
 
 		newCond().IsDistinctFrom("", 1),
 		newCond().IsNotDistinctFrom("", 1),
+		newCond().IsDistinctFromField("", "b"),
+		newCond().IsDistinctFromField("a", ""),
+		newCond().IsNotDistinctFromField("", "b"),
+		newCond().IsNotDistinctFromField("a", ""),
 	}
 
 	expected := ""
@@ -178,28 +184,40 @@ func TestCondWithFlavor(t *testing.T) {
 		cond.NotILike("f2", 2),
 		cond.IsDistinctFrom("f3", 3),
 		cond.IsNotDistinctFrom("f4", 4),
+		cond.IsDistinctFromField("f5", "g5"),
+		cond.IsNotDistinctFromField("f6", "g6"),
 	}, "\n")
 	expectedResults := map[Flavor]string{
 		PostgreSQL: `f1 ILIKE $1
 f2 NOT ILIKE $2
 f3 IS DISTINCT FROM $3
-f4 IS NOT DISTINCT FROM $4`,
+f4 IS NOT DISTINCT FROM $4
+f5 IS DISTINCT FROM g5
+f6 IS NOT DISTINCT FROM g6`,
 		MySQL: `LOWER(f1) LIKE LOWER(?)
 LOWER(f2) NOT LIKE LOWER(?)
 NOT f3 <=> ?
-f4 <=> ?`,
+f4 <=> ?
+NOT f5 <=> g5
+f6 <=> g6`,
 		SQLite: `LOWER(f1) LIKE LOWER(?)
 LOWER(f2) NOT LIKE LOWER(?)
 f3 IS DISTINCT FROM ?
-f4 IS NOT DISTINCT FROM ?`,
+f4 IS NOT DISTINCT FROM ?
+f5 IS DISTINCT FROM g5
+f6 IS NOT DISTINCT FROM g6`,
 		Presto: `LOWER(f1) LIKE LOWER(?)
 LOWER(f2) NOT LIKE LOWER(?)
 CASE WHEN f3 IS NULL AND ? IS NULL THEN 0 WHEN f3 IS NOT NULL AND ? IS NOT NULL AND f3 = ? THEN 0 ELSE 1 END = 1
-CASE WHEN f4 IS NULL AND ? IS NULL THEN 1 WHEN f4 IS NOT NULL AND ? IS NOT NULL AND f4 = ? THEN 1 ELSE 0 END = 1`,
+CASE WHEN f4 IS NULL AND ? IS NULL THEN 1 WHEN f4 IS NOT NULL AND ? IS NOT NULL AND f4 = ? THEN 1 ELSE 0 END = 1
+CASE WHEN f5 IS NULL AND g5 IS NULL THEN 0 WHEN f5 IS NOT NULL AND g5 IS NOT NULL AND f5 = g5 THEN 0 ELSE 1 END = 1
+CASE WHEN f6 IS NULL AND g6 IS NULL THEN 1 WHEN f6 IS NOT NULL AND g6 IS NOT NULL AND f6 = g6 THEN 1 ELSE 0 END = 1`,
 		ClickHouse: `f1 ILIKE ?
 f2 NOT ILIKE ?
 CASE WHEN f3 IS NULL AND ? IS NULL THEN 0 WHEN f3 IS NOT NULL AND ? IS NOT NULL AND f3 = ? THEN 0 ELSE 1 END = 1
-CASE WHEN f4 IS NULL AND ? IS NULL THEN 1 WHEN f4 IS NOT NULL AND ? IS NOT NULL AND f4 = ? THEN 1 ELSE 0 END = 1`,
+CASE WHEN f4 IS NULL AND ? IS NULL THEN 1 WHEN f4 IS NOT NULL AND ? IS NOT NULL AND f4 = ? THEN 1 ELSE 0 END = 1
+CASE WHEN f5 IS NULL AND g5 IS NULL THEN 0 WHEN f5 IS NOT NULL AND g5 IS NOT NULL AND f5 = g5 THEN 0 ELSE 1 END = 1
+CASE WHEN f6 IS NULL AND g6 IS NULL THEN 1 WHEN f6 IS NOT NULL AND g6 IS NOT NULL AND f6 = g6 THEN 1 ELSE 0 END = 1`,
 	}
 
 	for flavor, expected := range expectedResults {

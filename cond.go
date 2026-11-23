@@ -632,6 +632,112 @@ func (c *Cond) IsNotDistinctFrom(field string, value interface{}) string {
 	})
 }
 
+// IsDistinctFromField is used to construct the expression
+// "fieldA IS DISTINCT FROM fieldB" to compare two fields in a NULL-safe way.
+//
+// It's designed for scenarios like incremental reconciliation, in which rows
+// from two snapshots are matched by business keys and then compared column by
+// column. Unlike a plain "fieldA <> fieldB" comparison, it also reports a
+// change when a nullable column turns from NULL into a concrete value or the
+// other way around.
+//
+// When the database system does not support the IS DISTINCT FROM operator,
+// the IsDistinctFromField method will return "NOT fieldA <=> fieldB" for
+// MySQL or a "CASE ... WHEN ... ELSE ... END" expression to simulate the
+// behavior of the IS DISTINCT FROM operator.
+func (c *Cond) IsDistinctFromField(fieldA, fieldB string) string {
+	if len(fieldA) == 0 || len(fieldB) == 0 {
+		return ""
+	}
+
+	return c.Var(condBuilder{
+		Builder: func(ctx *argsCompileContext) {
+			switch ctx.Flavor {
+			case PostgreSQL, SQLite, SQLServer:
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" IS DISTINCT FROM ")
+				ctx.WriteString(fieldB)
+
+			case MySQL:
+				ctx.WriteString("NOT ")
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" <=> ")
+				ctx.WriteString(fieldB)
+
+			default:
+				// CASE
+				//     WHEN fieldA IS NULL AND fieldB IS NULL THEN 0
+				//     WHEN fieldA IS NOT NULL AND fieldB IS NOT NULL AND fieldA = fieldB THEN 0
+				//     ELSE 1
+				// END = 1
+				ctx.WriteString("CASE WHEN ")
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" IS NULL AND ")
+				ctx.WriteString(fieldB)
+				ctx.WriteString(" IS NULL THEN 0 WHEN ")
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" IS NOT NULL AND ")
+				ctx.WriteString(fieldB)
+				ctx.WriteString(" IS NOT NULL AND ")
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" = ")
+				ctx.WriteString(fieldB)
+				ctx.WriteString(" THEN 0 ELSE 1 END = 1")
+			}
+		},
+	})
+}
+
+// IsNotDistinctFromField is used to construct the expression
+// "fieldA IS NOT DISTINCT FROM fieldB" to compare two fields in a NULL-safe
+// way. Two NULL fields are considered equal by this expression.
+//
+// When the database system does not support the IS NOT DISTINCT FROM
+// operator, the IsNotDistinctFromField method will return "fieldA <=> fieldB"
+// for MySQL or a "CASE ... WHEN ... ELSE ... END" expression to simulate the
+// behavior of the IS NOT DISTINCT FROM operator.
+func (c *Cond) IsNotDistinctFromField(fieldA, fieldB string) string {
+	if len(fieldA) == 0 || len(fieldB) == 0 {
+		return ""
+	}
+
+	return c.Var(condBuilder{
+		Builder: func(ctx *argsCompileContext) {
+			switch ctx.Flavor {
+			case PostgreSQL, SQLite, SQLServer:
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" IS NOT DISTINCT FROM ")
+				ctx.WriteString(fieldB)
+
+			case MySQL:
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" <=> ")
+				ctx.WriteString(fieldB)
+
+			default:
+				// CASE
+				//     WHEN fieldA IS NULL AND fieldB IS NULL THEN 1
+				//     WHEN fieldA IS NOT NULL AND fieldB IS NOT NULL AND fieldA = fieldB THEN 1
+				//     ELSE 0
+				// END = 1
+				ctx.WriteString("CASE WHEN ")
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" IS NULL AND ")
+				ctx.WriteString(fieldB)
+				ctx.WriteString(" IS NULL THEN 1 WHEN ")
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" IS NOT NULL AND ")
+				ctx.WriteString(fieldB)
+				ctx.WriteString(" IS NOT NULL AND ")
+				ctx.WriteString(fieldA)
+				ctx.WriteString(" = ")
+				ctx.WriteString(fieldB)
+				ctx.WriteString(" THEN 1 ELSE 0 END = 1")
+			}
+		},
+	})
+}
+
 // Var returns a placeholder for value.
 func (c *Cond) Var(value interface{}) string {
 	return c.Args.Add(value)
